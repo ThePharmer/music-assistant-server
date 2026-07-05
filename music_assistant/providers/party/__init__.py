@@ -7,9 +7,13 @@ to add songs to the queue with configurable rate limiting.
 from __future__ import annotations
 
 import asyncio
+import hashlib
+import hmac
+import secrets
 from collections.abc import Callable
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, cast
+from uuid import uuid4
 
 from mashumaro import DataClassDictMixin
 from music_assistant_models.auth import User, UserRole
@@ -93,6 +97,13 @@ PARTY_GUEST_DISPLAY_NAME = "Party Guest"
 # Extra attribute keys for tracking guest items in the queue
 ATTR_PARTY_GUEST = "party_guest"
 ATTR_PARTY_BOOSTED = "party_boosted"
+ATTR_PARTY_GUEST_ID = "party_guest_id"
+ATTR_PARTY_GUEST_NAME = "party_guest_name"
+
+# Guest identity signing
+CONF_GUEST_ID_SECRET = "guest_id_secret"
+MAX_GUEST_NAME_LENGTH = 24
+DEFAULT_GUEST_NAME = "Guest"
 
 SUPPORTED_FEATURES: set[ProviderFeature] = set()
 
@@ -517,6 +528,9 @@ class PartyPlugin(PluginProvider):
         )
         # Guest action commands - these are called by the guest frontend
         self._unregister_handles.append(
+            self.mass.register_api_command("party/register_guest", self.register_guest)
+        )
+        self._unregister_handles.append(
             self.mass.register_api_command("party/add_to_queue", self.add_to_queue)
         )
         self._unregister_handles.append(
@@ -690,10 +704,36 @@ class PartyPlugin(PluginProvider):
 
     # ==================== Guest Action API Commands ====================
 
+    async def register_guest(self, display_name: str = "") -> dict[str, str]:
+        """Register a guest identity and return signed credentials.
+
+        The returned credentials should be stored client-side and passed along
+        with guest actions so queue items can be attributed to this guest.
+
+        :param display_name: Requested display name for this guest.
+        :returns: Dict with guest_id, guest_sig and the accepted display_name.
+        """
+        self._validate_guest_access()
+        if not self.config.get_value(CONF_ENABLE_GUEST_ACCESS):
+            raise InvalidDataError("Party guest access is disabled")
+
+        name = self._sanitize_guest_name(display_name)
+        guest_id = uuid4().hex
+        guest_sig = self._sign_guest_identity(guest_id, name)
+        self.logger.info("Registered party guest '%s' (%s)", name, guest_id)
+        return {
+            "guest_id": guest_id,
+            "guest_sig": guest_sig,
+            "display_name": name,
+        }
+
     async def add_to_queue(
         self,
         uri: str,
         boost: bool = False,
+        guest_id: str | None = None,
+        guest_name: str | None = None,
+        guest_sig: str | None = None,
     ) -> dict[str, Any]:
         """Add a media item to the party queue.
 
@@ -702,9 +742,12 @@ class PartyPlugin(PluginProvider):
 
         :param uri: The URI of the media item to add (e.g., "spotify://track/xxx").
         :param boost: If True, insert at the front of the guest section (play next).
+        :param guest_id: Optional guest identifier from party/register_guest.
+        :param guest_name: Optional guest display name bound to the signature.
+        :param guest_sig: Optional signature proving the guest identity.
         :returns: Result dict with success status and queue position info.
         """
-        self._validate_guest_access()
+        self._validate_guest_access(guest_id, guest_name, guest_sig)
 
         # Check if guest access is enabled
         if not self.config.get_value(CONF_ENABLE_GUEST_ACCESS):
@@ -728,9 +771,14 @@ class PartyPlugin(PluginProvider):
         # Handle different scenarios based on queue state and boost mode
         started_playback = False
 
+        identity_attrs: dict[str, Any] = {}
+        if guest_id and guest_name:
+            identity_attrs[ATTR_PARTY_GUEST_ID] = guest_id
+            identity_attrs[ATTR_PARTY_GUEST_NAME] = guest_name
+
         if queue.state == PlaybackState.PLAYING:
             # Queue is actively playing — insert into the priority section
-            extra_attrs: dict[str, Any] = {ATTR_PARTY_GUEST: True}
+            extra_attrs: dict[str, Any] = {ATTR_PARTY_GUEST: True, **identity_attrs}
             if boost:
                 extra_attrs[ATTR_PARTY_BOOSTED] = True
             await self._add_to_priority_section(queue_id, uri, extra_attrs)
@@ -750,6 +798,7 @@ class PartyPlugin(PluginProvider):
                     raise InvalidDataError(f"Cannot add {uri} to queue - not a playable item")
                 queue_item = QueueItem.from_media_item(queue_id, media_item)  # type: ignore[arg-type]
                 queue_item.extra_attributes[ATTR_PARTY_GUEST] = True
+                queue_item.extra_attributes.update(identity_attrs)
                 if boost:
                     queue_item.extra_attributes[ATTR_PARTY_BOOSTED] = True
                 # Insert after current position if queue has one, otherwise at the start
@@ -779,16 +828,25 @@ class PartyPlugin(PluginProvider):
             "started_playback": started_playback,
         }
 
-    async def boost_queue_item(self, queue_item_id: str) -> dict[str, Any]:
+    async def boost_queue_item(
+        self,
+        queue_item_id: str,
+        guest_id: str | None = None,
+        guest_name: str | None = None,
+        guest_sig: str | None = None,
+    ) -> dict[str, Any]:
         """Boost an existing queue item by moving it to the boosted section.
 
         Finds the item in the queue, marks it as boosted, and moves it to the
         end of the boosted priority section (right after the currently playing track).
 
         :param queue_item_id: The queue_item_id of the item to boost.
+        :param guest_id: Optional guest identifier from party/register_guest.
+        :param guest_name: Optional guest display name bound to the signature.
+        :param guest_sig: Optional signature proving the guest identity.
         :returns: Result dict with success status.
         """
-        self._validate_guest_access()
+        self._validate_guest_access(guest_id, guest_name, guest_sig)
         if not self.config.get_value(CONF_ENABLE_GUEST_ACCESS):
             raise InvalidDataError("Party guest access is disabled")
         if not self.config.get_value(CONF_ENABLE_BOOST):
@@ -945,15 +1003,73 @@ class PartyPlugin(PluginProvider):
                 shuffle=False,
             )
 
-    @staticmethod
-    def _validate_guest_access() -> None:
+    def _validate_guest_access(
+        self,
+        guest_id: str | None = None,
+        guest_name: str | None = None,
+        guest_sig: str | None = None,
+    ) -> None:
         """Validate the current user is an authenticated party guest.
 
-        :raises InvalidDataError: If the user is not a party guest.
+        When guest identity credentials are provided, the HMAC signature is
+        also verified so queue attribution cannot be spoofed.
+
+        :param guest_id: Optional guest identifier from party/register_guest.
+        :param guest_name: Optional guest display name bound to the signature.
+        :param guest_sig: Optional signature proving the guest identity.
+        :raises InvalidDataError: If the user is not a party guest or the identity is invalid.
         """
         user = get_current_user()
         if not user or user.username != PARTY_GUEST_USER:
             raise InvalidDataError("This endpoint is only available to party guests")
+        if guest_id is None and guest_name is None and guest_sig is None:
+            # Identity is optional (stock frontend compatibility) - items are
+            # simply not attributed to an individual guest
+            return
+        if not (guest_id and guest_name and guest_sig) or not self._verify_guest_identity(
+            guest_id, guest_name, guest_sig
+        ):
+            raise InvalidDataError("Invalid guest identity")
+
+    def _get_guest_secret(self) -> bytes:
+        """Return the per-instance secret used to sign guest identities."""
+        secret = self.mass.config.get_raw_provider_config_value(
+            self.instance_id, CONF_GUEST_ID_SECRET
+        )
+        if not isinstance(secret, str) or not secret:
+            secret = secrets.token_hex(32)
+            self.mass.config.set_raw_provider_config_value(
+                self.instance_id, CONF_GUEST_ID_SECRET, secret
+            )
+        return secret.encode()
+
+    def _sign_guest_identity(self, guest_id: str, display_name: str) -> str:
+        """Return the HMAC signature for a guest identity.
+
+        :param guest_id: The guest identifier to sign.
+        :param display_name: The (sanitized) display name bound to the identity.
+        """
+        # Newline separator is unambiguous: sanitized names cannot contain newlines
+        message = f"{guest_id}\n{display_name}".encode()
+        return hmac.new(self._get_guest_secret(), message, hashlib.sha256).hexdigest()
+
+    def _verify_guest_identity(self, guest_id: str, display_name: str, signature: str) -> bool:
+        """Return whether a guest identity signature is valid.
+
+        :param guest_id: The guest identifier to verify.
+        :param display_name: The display name bound to the identity.
+        :param signature: The signature to check.
+        """
+        expected = self._sign_guest_identity(guest_id, display_name)
+        return hmac.compare_digest(expected, signature)
+
+    @staticmethod
+    def _sanitize_guest_name(display_name: str) -> str:
+        """Return a display name normalized for queue attribution."""
+        name = " ".join(str(display_name).split())
+        if not name:
+            return DEFAULT_GUEST_NAME
+        return name[:MAX_GUEST_NAME_LENGTH]
 
     @staticmethod
     def _queue_contains_uri(queue_items: list[QueueItem], uri: str) -> bool:
@@ -987,12 +1103,20 @@ class PartyPlugin(PluginProvider):
 
         return section_end
 
-    async def skip_current(self) -> dict[str, Any]:
+    async def skip_current(
+        self,
+        guest_id: str | None = None,
+        guest_name: str | None = None,
+        guest_sig: str | None = None,
+    ) -> dict[str, Any]:
         """Skip the currently playing track.
 
+        :param guest_id: Optional guest identifier from party/register_guest.
+        :param guest_name: Optional guest display name bound to the signature.
+        :param guest_sig: Optional signature proving the guest identity.
         :returns: Result dict with success status.
         """
-        self._validate_guest_access()
+        self._validate_guest_access(guest_id, guest_name, guest_sig)
 
         # Check if guest access and skip are enabled
         if not self.config.get_value(CONF_ENABLE_GUEST_ACCESS):
