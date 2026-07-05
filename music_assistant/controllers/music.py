@@ -521,9 +521,18 @@ class MusicController(CoreController):
                 media_types,
                 limit,
             )
-        except MusicAssistantError as err:
+        except Exception as err:
+            # Degrade gracefully: one failing provider must not kill the entire
+            # search (and thus return zero results from all healthy providers)
             self.logger.warning("Search on provider %s failed: %s", prov.name, err)
-            raise MusicAssistantError(f"Search failed due to an error on {prov.name}") from err
+            return SearchResults()
+        if prov_search_results is None:
+            # Defensive: a badly behaved provider can return None at runtime
+            # despite the interface annotation (e.g. a stub search implementation)
+            self.logger.warning(  # type: ignore[unreachable]
+                "Search on provider %s returned no results object", prov.name
+            )
+            return SearchResults()
         if skip_item_ids:
             # filter out items already in skip_item_ids
             prov_search_results.artists = [
